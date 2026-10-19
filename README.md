@@ -1,14 +1,15 @@
 # UNIPUS MOOC 自动导航播放器
 
-这是一个基于 Node.js + Playwright 的课程自动导航播放器。它从 `.env` 读取课程地址，使用本机 Google Chrome 打开课程，识别课程目录中的视频任务，按顺序播放并等待结束。
+这是一个基于 Node.js + Playwright 的课程自动导航播放器。它从 `.env` 读取课程地址和登录凭据，默认使用本机 Microsoft Edge 打开课程，识别课程目录中的视频任务，按顺序播放并等待结束。
 
-它不会答题、提交作业、处理验证码或绕过平台的登录与风控流程。首次运行需要在弹出的 Chrome 窗口中手动登录，登录状态保存在 `.browser-profile/`，后续运行可复用。
+账号密码通过 `.env` 自动提交。登录状态按浏览器隔离保存在 `.browser-profile/<浏览器>/`，后续运行可复用会话。遇到验证码、二次验证或平台风控时，脚本会回退到手动处理，不会绕过这些流程。
 
 ## 运行环境
 
 - Windows 10/11
 - Node.js 20 或更高版本
-- 已安装 Google Chrome
+- 已安装 Microsoft Edge、Google Chrome、Chromium 或 Firefox 之一
+- 默认使用 Microsoft Edge
 
 ## 安装
 
@@ -18,21 +19,35 @@
 npm install
 ```
 
-如果只想使用本机 Chrome，不需要额外下载 Playwright 浏览器。
+项目使用 `playwright-core`，直接调用本机已安装的浏览器，不需要额外下载 Playwright 浏览器。
 
 ## 配置
 
-编辑 `.env`，把 `COURSE_URL` 换成要学习的课程入口：
+编辑 `.env`，填写课程入口和 UNIPUS 登录凭据：
 
 ```dotenv
 COURSE_URL=https://moocs.unipus.cn/my/course/8021
+BROWSER=edge
+
+UNIPUS_USERNAME=你的账号
+UNIPUS_PASSWORD=你的密码
 ```
 
 常用选项：
 
+`UNIPUS_USERNAME` 可以填写手机号、用户名或邮箱；手机号按中国大陆 `+86` 处理。密码保存在 `.env` 中，不要写进脚本或提交到 Git。
+
+
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `HEADLESS` | `false` | 必须保持 `false` 才能手动登录并处理平台提示 |
+| `BROWSER` | `edge` | `edge`、`chrome`、`chromium` 或 `firefox` |
+| `BROWSER_EXECUTABLE` | 空 | 可选，指定浏览器可执行文件的完整路径 |
+| `BROWSER_PROFILE_DIR` | 空 | 可选，覆盖按浏览器自动生成的配置目录 |
+| `AUTO_LOGIN` | `true` | 是否使用 `.env` 凭据自动登录 |
+| `LOGIN_MODE` | `auto` | `auto`、`username` 或 `phone` |
+| `ACCEPT_LOGIN_AGREEMENT` | `true` | 自动登录时是否勾选登录协议 |
+| `TASK_DISCOVERY_TIMEOUT_MS` | `20000` | 等待课程目录异步加载的最长时间 |
+| `HEADLESS` | `false` | 需要处理验证码时请保持 `false` |
 | `PLAYBACK_RATE` | `1` | 正常播放速率；平台可能按实际时长记录 |
 | `MUTE_VIDEO` | `true` | 播放时静音 |
 | `SKIP_COMPLETED` | `true` | 根据课程目录图标跳过已完成任务 |
@@ -40,7 +55,9 @@ COURSE_URL=https://moocs.unipus.cn/my/course/8021
 | `VIDEO_MAX_WATCH_MINUTES` | `240` | 单个视频的最大等待分钟数，`0` 表示不限制 |
 | `KEEP_BROWSER_OPEN` | `false` | 完成后是否保留浏览器窗口 |
 
-浏览器登录状态保存在 `.browser-profile/`，不要把该目录或 `.env` 提交到仓库。
+浏览器配置目录按浏览器隔离，例如 Edge 使用 `.browser-profile/edge`，Chrome 使用 `.browser-profile/chrome`。这样切换浏览器时不会复用不兼容的 Chromium/Firefox 配置。
+
+不要把 `.env` 或 `.browser-profile/` 提交到仓库。
 
 ## 使用
 
@@ -50,7 +67,7 @@ COURSE_URL=https://moocs.unipus.cn/my/course/8021
 npm start -- --dry-run
 ```
 
-首次运行会进入 UNIPUS 登录页。请在弹出的 Chrome 中手动完成登录。脚本确认进入课程页后会自动扫描并列出识别到的视频任务，但不会播放。
+首次运行且 `.env` 中没有凭据时，脚本会停在登录页等待手动登录。填写 `UNIPUS_USERNAME` 和 `UNIPUS_PASSWORD` 后，脚本会自动填写并提交登录表单。如果平台弹出验证码或二次验证，仍需要在浏览器中手动完成。脚本确认进入课程页后会自动扫描并列出识别到的视频任务，但不会播放。
 
 确认列表正确后开始播放：
 
@@ -62,16 +79,31 @@ npm start
 
 按 `Ctrl+C` 可以停止。下次运行会重新读取课程目录，已完成任务通常会被平台图标标记并跳过。
 
+## 浏览器适配
+
+`BROWSER=edge` 是默认值，对应 Microsoft Edge 的 `msedge` 通道。切换浏览器时修改：
+
+```dotenv
+BROWSER=chrome
+# 或
+BROWSER=firefox
+```
+
+如果浏览器安装在非标准位置，可设置 `BROWSER_EXECUTABLE=C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe`。不同浏览器使用独立配置目录，首次切换时需要重新自动登录一次。
+
 ## 页面结构变化
 
+
+
 平台页面如果改版，优先用 dry-run 检查识别结果。相关配置在 `.env`：
+
 
 - `TASK_SELECTOR`：课程目录任务链接选择器
 - `VIDEO_KEYWORDS`：判断任务为视频的 URL、文字或图标关键词
 - `EXCLUDE_KEYWORDS`：排除作业、测验、考试、讨论等任务
 - `COMPLETED_KEYWORDS`：识别已完成状态的图标关键词
 
-默认规则来自当前平台常见的 `a[href*="task"]` 和 `videoclass` 图标结构。脚本只在任务被明确识别为视频时进入任务页，避免误点作业或测验。
+当前 UNIPUS 目录使用 `li.task-item.task-content`，视频任务链接通常是 `a.title[href*="/task/"]`，视频类型由 `es-icon-videoclass` 图标标识。脚本会等待目录异步加载后再扫描，避免页面刚打开时误报“没有识别到视频任务”。
 
 ## 注意事项
 

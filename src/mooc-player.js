@@ -2,10 +2,27 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
-import { chromium } from "playwright-core";
+import { chromium, firefox } from "playwright-core";
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ROOT_DIR = path.resolve(SCRIPT_DIR, "..");
+
+const BROWSER_PRESETS = {
+  edge: { id: "edge", label: "Microsoft Edge", engine: "chromium", channel: "msedge" },
+  chrome: { id: "chrome", label: "Google Chrome", engine: "chromium", channel: "chrome" },
+  chromium: { id: "chromium", label: "Chromium", engine: "chromium", channel: "chromium" },
+  firefox: { id: "firefox", label: "Mozilla Firefox", engine: "firefox", channel: "" },
+};
+
+const BROWSER_ALIASES = {
+  msedge: "edge",
+  "microsoft-edge": "edge",
+  googlechrome: "chrome",
+  "google-chrome": "chrome",
+  ff: "firefox",
+};
+
+const UNIPUS_COUNTRY_CODE = "+86";
 
 const LEVEL_COLOR = {
   info: "\u001b[36m",
@@ -64,6 +81,24 @@ async function loadEnvFile(filePath) {
 function envString(name, fallback = "") {
   const value = process.env[name];
   return value === undefined || value.trim() === "" ? fallback : value.trim();
+}
+
+function envRaw(name, fallback = "") {
+  const value = process.env[name];
+  return value === undefined ? fallback : value;
+}
+
+function resolveBrowser(rawName, executable) {
+  const requested = String(rawName || "edge").trim().toLowerCase();
+  const preset = BROWSER_PRESETS[BROWSER_ALIASES[requested] ?? requested];
+  if (!preset) {
+    throw new Error(`Unsupported BROWSER=${rawName}. Use edge, chrome, chromium, or firefox.`);
+  }
+
+  return {
+    ...preset,
+    executable: executable ? resolveFromRoot(executable) : "",
+  };
 }
 
 function envNumber(name, fallback, { min = -Infinity, max = Infinity } = {}) {
@@ -141,13 +176,30 @@ async function readConfig() {
     throw new Error("COURSE_URL must point to moocs.unipus.cn.");
   }
 
+  const browser = resolveBrowser(
+    envString("BROWSER", envString("BROWSER_CHANNEL", "edge")),
+    envString("BROWSER_EXECUTABLE"),
+  );
+  const profileRoot = resolveFromRoot(envString("USER_DATA_DIR", ".browser-profile"));
+  const profileOverride = envString("BROWSER_PROFILE_DIR");
+  const userDataDir = profileOverride
+    ? resolveFromRoot(profileOverride)
+    : path.join(profileRoot, browser.id);
+
   return {
     courseUrl,
-    browserChannel: envString("BROWSER_CHANNEL", "chrome"),
-    browserExecutable: envString("BROWSER_EXECUTABLE"),
+    browser,
+    username: envString("UNIPUS_USERNAME", envString("UNIPUS_ACCOUNT")),
+    password: envRaw("UNIPUS_PASSWORD", envRaw("UNIPUS_PASS")),
+    autoLogin: envBoolean("AUTO_LOGIN", true),
+    loginMode: envString("LOGIN_MODE", "auto").toLowerCase(),
+    acceptLoginAgreement: envBoolean("ACCEPT_LOGIN_AGREEMENT", true),
     headless: envBoolean("HEADLESS", false),
     slowMo: envNumber("SLOW_MO", 0, { min: 0, max: 5000 }),
-    userDataDir: resolveFromRoot(envString("USER_DATA_DIR", ".browser-profile")),
+    userDataDir,
+    taskDiscoveryTimeoutMs: envNumber("TASK_DISCOVERY_TIMEOUT_MS", 20000, {
+      min: 1000,
+    }),
     loginWaitTimeoutMs: envNumber("LOGIN_WAIT_TIMEOUT_MS", 900000, { min: 10000 }),
     navigationTimeoutMs: envNumber("NAVIGATION_TIMEOUT_MS", 60000, { min: 5000 }),
     videoWaitTimeoutMs: envNumber("VIDEO_WAIT_TIMEOUT_MS", 60000, { min: 5000 }),
@@ -157,7 +209,7 @@ async function readConfig() {
     skipCompleted: envBoolean("SKIP_COMPLETED", true),
     taskSelector: envString(
       "TASK_SELECTOR",
-      'a[href*="task"],a[href*="/courseware/"],a[href*="/lesson/"]',
+      'a.title[href*="/task/"],a[href*="task"],a[href*="/courseware/"],a[href*="/lesson/"],a[data-task-id]',
     ),
     videoKeywords: splitKeywords(envString("VIDEO_KEYWORDS", "videoclass,video,视频,观看")),
     excludeKeywords: splitKeywords(
@@ -195,7 +247,19 @@ async function collectTasks(page, config) {
 
           const anchors = Array.from(document.querySelectorAll(selector));
           return anchors.flatMap((anchor) => {
-            const href = anchor.getAttribute("href");
+            const taskRoot = anchor.closest(".task-item, [data-task-id], li");
+            const taskId =
+              anchor.getAttribute("data-task-id") ||
+              taskRoot?.getAttribute("data-task-id") ||
+              taskRoot?.id?.match(/task_id_(\d+)/)?.[1] ||
+              "";
+            const courseId = location.pathname.match(/\/course\/(\d+)/)?.[1] || "";
+            const href =
+              anchor.getAttribute("href") ||
+              anchor.getAttribute("data-href") ||
+              taskRoot?.getAttribute("data-url") ||
+              taskRoot?.getAttribute("data-href") ||
+              (taskId && courseId ? `/course/${courseId}/task/${taskId}/show` : "");
             if (!href || href.startsWith("javascript:") || href === "#") return [];
 
             let absoluteUrl;
@@ -207,14 +271,21 @@ async function collectTasks(page, config) {
 
             const text = (anchor.innerText || anchor.textContent || "")
               .replace(/\s+/g, " ")
+              .trim() ||
+              (taskRoot?.innerText || taskRoot?.textContent || "")
+              .replace(/\s+/g, " ")
               .trim();
             if (!text) return [];
 
-            const context = [];
-            let node = anchor;
-            for (let depth = 0; node && depth < 6; depth += 1) {
-              context.push(node);
-              node = node.parentElement;
+            const context = [anchor];
+            if (taskRoot && taskRoot !== anchor) {
+              context.push(taskRoot);
+            } else {
+              let node = anchor.parentElement;
+              for (let depth = 0; node && depth < 3; depth += 1) {
+                context.push(node);
+                node = node.parentElement;
+              }
             }
 
             const contextClasses = context
@@ -240,6 +311,7 @@ async function collectTasks(page, config) {
 
             return [
               {
+                taskId,
                 url: absoluteUrl,
                 text,
                 completed,
@@ -300,16 +372,29 @@ async function clickVisibleExactText(page, labels) {
 }
 
 async function prepareOutline(page, config) {
-  let tasks = await collectTasks(page, config);
-  if (tasks.length > 0) return tasks;
+  const deadline = Date.now() + config.taskDiscoveryTimeoutMs;
+  let directoryClicked = false;
 
-  const opened = await clickVisibleExactText(page, ["目录", "课程目录", "章节目录"]);
-  if (opened) {
-    await page.waitForTimeout(1500);
-    tasks = await collectTasks(page, config);
+  while (Date.now() < deadline) {
+    const tasks = await collectTasks(page, config);
+    if (tasks.length > 0) return tasks;
+
+    if (!directoryClicked) {
+      directoryClicked = await clickVisibleExactText(page, ["目录", "课程目录", "章节目录"]);
+      if (directoryClicked) {
+        await page.waitForTimeout(1000);
+      }
+    }
+
+    await page.waitForTimeout(1000);
   }
 
-  return tasks;
+  log(
+    "warn",
+    `等待 ${Math.ceil(config.taskDiscoveryTimeoutMs / 1000)} 秒后仍未发现任务，将再做一次页面刷新检查。`,
+  );
+  await reloadCourse(page, config);
+  return collectTasks(page, config);
 }
 
 function printTaskList(tasks, config) {
@@ -322,9 +407,110 @@ function printTaskList(tasks, config) {
   return pending;
 }
 
+function looksLikePhoneNumber(value) {
+  return /^\+?[\d\s-]{6,20}$/.test(value.trim());
+}
+
+async function fillFirstVisible(page, selectors, value) {
+  for (const frame of page.frames()) {
+    for (const selector of selectors) {
+      try {
+        const locator = frame.locator(selector).first();
+        if (await locator.isVisible().catch(() => false)) {
+          await locator.fill(value, { timeout: 5000 });
+          return true;
+        }
+      } catch {
+        // Try the next selector or frame.
+      }
+    }
+  }
+  return false;
+}
+
+async function attemptAutomaticLogin(page, config) {
+  const mode = ["auto", "username", "phone"].includes(config.loginMode)
+    ? config.loginMode
+    : "auto";
+  const useUsername =
+    mode === "username" || (mode === "auto" && !looksLikePhoneNumber(config.username));
+
+  if (useUsername) {
+    await clickVisibleExactText(page, ["用户名/邮箱登录", "用户名登录"]);
+    await page.waitForTimeout(500);
+  }
+
+  let phone = config.username.replace(/[\s-]/g, "");
+  if (phone.startsWith(UNIPUS_COUNTRY_CODE)) {
+    phone = phone.slice(UNIPUS_COUNTRY_CODE.length);
+  }
+
+  const accountFilled = useUsername
+    ? await fillFirstVisible(
+        page,
+        [
+          "#username",
+          'input[autocomplete="username"]',
+          'input[placeholder*="用户名"]',
+          'input[placeholder*="邮箱"]',
+        ],
+        config.username,
+      )
+    : await fillFirstVisible(
+        page,
+        ["#phone", 'input[autocomplete="username"]', 'input[placeholder*="手机"]'],
+        phone,
+      );
+  if (!accountFilled) return false;
+
+  const passwordFilled = await fillFirstVisible(
+    page,
+    ["#password", 'input[type="password"]'],
+    config.password,
+  );
+  if (!passwordFilled) return false;
+
+  if (config.acceptLoginAgreement) {
+    for (const frame of page.frames()) {
+      const checkbox = frame.locator("#agreement").first();
+      try {
+        if ((await checkbox.count()) > 0 && !(await checkbox.isChecked())) {
+          await checkbox.check({ force: true, timeout: 3000 });
+        }
+      } catch {
+        // The agreement checkbox is optional on some login variants.
+      }
+    }
+  }
+
+  let submitted = false;
+  for (const frame of page.frames()) {
+    try {
+      const button = frame.locator("button.ugsso-btn-primary").first();
+      if (await button.isVisible().catch(() => false)) {
+        await button.click({ timeout: 5000 });
+        submitted = true;
+        break;
+      }
+    } catch {
+      // Try another frame.
+    }
+  }
+  if (!submitted) return false;
+
+  const deadline = Date.now() + 15000;
+  while (Date.now() < deadline) {
+    if (!isLoginUrl(page.url())) return true;
+    await page.waitForTimeout(500);
+  }
+  return false;
+}
+
 async function waitForAuthenticatedCourse(page, config) {
   const deadline = Date.now() + config.loginWaitTimeoutMs;
   let loginMessageShown = false;
+  const autoLoginConfigured = Boolean(config.autoLogin && config.username && config.password);
+  let autoLoginAttempted = !autoLoginConfigured;
 
   await page.goto(config.courseUrl, {
     waitUntil: "domcontentloaded",
@@ -336,12 +522,28 @@ async function waitForAuthenticatedCourse(page, config) {
     const currentUrl = page.url();
 
     if (isLoginUrl(currentUrl)) {
+      if (!autoLoginAttempted) {
+        autoLoginAttempted = true;
+        log("info", `检测到登录页，正在使用 .env 中的账号自动登录 ${config.browser.label}。`);
+        const loggedIn = await attemptAutomaticLogin(page, config);
+        if (loggedIn) {
+          log("ok", "自动登录成功。");
+          await page.waitForTimeout(1000);
+          continue;
+        }
+      }
+
       if (!loginMessageShown) {
         loginMessageShown = true;
-        log("warn", "需要在打开的 Chrome 中手动登录 UNIPUS。脚本不会填写账号、处理验证码或绕过审查。");
+        log(
+          "warn",
+          autoLoginConfigured
+            ? `自动登录未完成，需要在 ${config.browser.label} 中手动处理。可能需要验证码、二次验证，或账号密码有误。`
+            : `未配置自动登录，需要在 ${config.browser.label} 中手动登录，或在 .env 填写 UNIPUS_USERNAME 和 UNIPUS_PASSWORD。`,
+        );
         log("warn", `登录完成后会自动继续，最多等待 ${Math.ceil(config.loginWaitTimeoutMs / 60000)} 分钟。`);
         if (config.headless) {
-          log("warn", "当前是 HEADLESS=true，无法手动登录。建议改用 HEADLESS=false。");
+          throw new Error("HEADLESS=true 时自动登录未完成；请检查账号密码，或改用 HEADLESS=false 手动完成验证。");
         }
       }
       await page.waitForTimeout(1000);
@@ -620,13 +822,28 @@ async function launchBrowser(config) {
     args: ["--start-maximized"],
   };
 
-  if (config.browserExecutable) {
-    options.executablePath = config.browserExecutable;
-  } else if (config.browserChannel) {
-    options.channel = config.browserChannel;
+  if (config.browser.engine === "chromium") {
+    options.args = ["--start-maximized"];
+  } else {
+    delete options.viewport;
   }
 
-  return chromium.launchPersistentContext(config.userDataDir, options);
+
+  if (config.browser.executable) {
+    options.executablePath = config.browser.executable;
+  } else if (config.browser.channel) {
+    options.channel = config.browser.channel;
+  }
+
+  const launcher = config.browser.engine === "firefox" ? firefox : chromium;
+  try {
+    return await launcher.launchPersistentContext(config.userDataDir, options);
+  } catch (error) {
+    throw new Error(
+      `无法启动 ${config.browser.label}。请确认浏览器已安装，或设置 BROWSER_EXECUTABLE。原始错误: ${error.message}`,
+      { cause: error },
+    );
+  }
 }
 
 async function main() {
@@ -635,6 +852,7 @@ async function main() {
   const course = new URL(config.courseUrl);
 
   log("info", `课程地址: ${course.href}`);
+  log("info", `浏览器: ${config.browser.label}`);
   log("info", `浏览器配置目录: ${config.userDataDir}`);
   if (config.playbackRate !== 1) {
     log("warn", `PLAYBACK_RATE=${config.playbackRate}。平台可能按实际观看时长记录，请自行确认课程规则。`);
@@ -653,7 +871,7 @@ async function main() {
     const allTasks = await prepareOutline(page, config);
     if (allTasks.length === 0) {
       throw new Error(
-        "没有识别到视频任务。请先确认课程目录已展开；必要时用 npm start -- --dry-run 调试 " +
+        "没有识别到视频任务。请先确认课程目录已展开；必要时检查 .env 中的 " +
           "TASK_SELECTOR 和 VIDEO_KEYWORDS。",
       );
     }
@@ -717,7 +935,7 @@ async function main() {
     if (!keepOpen) {
       await context.close().catch(() => {});
     } else {
-      log("warn", "浏览器保持打开。关闭 Chrome 后脚本会退出。");
+      log("warn", `浏览器保持打开。关闭 ${config.browser.label} 后脚本会退出。`);
       await new Promise((resolve) => context.once("close", resolve));
     }
   }
