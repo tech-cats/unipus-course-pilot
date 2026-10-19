@@ -1,0 +1,17 @@
+{
+  "name": "unipus-mooc-player",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Auto-navigation player for UNIPUS MOOC courses.",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/mooc-player.js",
+    "check": "node --check src/mooc-player.js"
+  },
+  "dependencies": {
+    "playwright-core": "^1.55.0"
+  }
+}
