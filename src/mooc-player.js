@@ -32,7 +32,61 @@ const LEVEL_COLOR = {
   reset: "\u001b[0m",
 };
 
+let progressLineActive = false;
+let lastPlainProgressBucket = -1;
+
+function clearProgressLine() {
+  if (!progressLineActive) return;
+  process.stdout.write("\r\u001b[2K");
+  progressLineActive = false;
+}
+
+function formatClock(value) {
+  if (!Number.isFinite(value) || value < 0) return "--:--";
+  const total = Math.floor(value);
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const secondsPart = total % 60;
+  return hours > 0
+    ? `${hours}:${String(minutes).padStart(2, "0")}:${String(secondsPart).padStart(2, "0")}`
+    : `${minutes}:${String(secondsPart).padStart(2, "0")}`;
+}
+
+function renderProgressBar(currentTime, duration, state = {}) {
+  if (!Number.isFinite(currentTime)) return;
+
+  const hasDuration = Number.isFinite(duration) && duration > 0;
+  const ratio = hasDuration ? Math.min(1, Math.max(0, currentTime / duration)) : 0;
+  const percent = hasDuration ? ratio * 100 : null;
+  const width = 28;
+  const filled = Math.round(ratio * width);
+  const bar = `${"#".repeat(filled)}${"-".repeat(width - filled)}`;
+  const status = state.ended
+    ? "已完成"
+    : state.paused
+      ? "暂停，尝试恢复"
+      : Number(state.readyState) < 2
+        ? "缓冲中"
+        : "播放中";
+  const percentText = percent === null ? "   --" : percent.toFixed(1).padStart(5, " ");
+  const line = `进度 [${bar}] ${percentText}% ${formatClock(currentTime)} / ${formatClock(duration)} ${status}`;
+
+  if (process.stdout.isTTY) {
+    const color = state.paused ? LEVEL_COLOR.warn : LEVEL_COLOR.info;
+    process.stdout.write(`\r\u001b[2K${color}${line}${LEVEL_COLOR.reset}`);
+    progressLineActive = true;
+    return;
+  }
+
+  const bucket = percent === null ? -1 : Math.floor(percent / 5) * 5;
+  if (bucket !== lastPlainProgressBucket) {
+    lastPlainProgressBucket = bucket;
+    console.log(line);
+  }
+}
+
 function log(level, message) {
+  clearProgressLine();
   const time = new Date().toLocaleTimeString("zh-CN", { hour12: false });
   const color = LEVEL_COLOR[level] ?? "";
   console.log(`${color}[${time}] ${message}${LEVEL_COLOR.reset}`);
@@ -399,11 +453,7 @@ async function prepareOutline(page, config) {
 
 function printTaskList(tasks, config) {
   const pending = config.skipCompleted ? tasks.filter((task) => !task.completed) : tasks;
-  log("info", `检测到 ${tasks.length} 个视频任务，本次待处理 ${pending.length} 个。`);
-  for (const [index, task] of tasks.entries()) {
-    const status = task.completed ? "已完成" : "待处理";
-    log("info", `${String(index + 1).padStart(2, "0")}. [${status}] ${task.text.slice(0, 90)}`);
-  }
+  log("info", `检测到 ${tasks.length} 个视频任务，其中 ${pending.length} 个待处理，将逐个处理。`);
   return pending;
 }
 
@@ -412,6 +462,8 @@ function looksLikePhoneNumber(value) {
 }
 
 async function fillFirstVisible(page, selectors, value) {
+  const deadline = Date.now() + 10000;
+
   for (const frame of page.frames()) {
     for (const selector of selectors) {
       try {
@@ -425,10 +477,59 @@ async function fillFirstVisible(page, selectors, value) {
       }
     }
   }
+
+  while (Date.now() < deadline) {
+    await page.waitForTimeout(250);
+    for (const frame of page.frames()) {
+      for (const selector of selectors) {
+        try {
+          const locator = frame.locator(selector).first();
+          if (await locator.isVisible().catch(() => false)) {
+            await locator.fill(value, { timeout: 5000 });
+            return true;
+          }
+        } catch {
+          // Keep waiting for a form that is still rendering.
+        }
+      }
+    }
+  }
+  return false;
+}
+
+async function waitForLoginForm(page, timeoutMs = 20000) {
+  const deadline = Date.now() + timeoutMs;
+
+  while (Date.now() < deadline) {
+    for (const frame of page.frames()) {
+      try {
+        const account = frame
+          .locator("#username, #phone, input[autocomplete='username']")
+          .first();
+        const password = frame.locator("#password, input[type='password']").first();
+        const submit = frame.locator("button.ugsso-btn-primary").first();
+        const visible = await Promise.all([
+          account.isVisible().catch(() => false),
+          password.isVisible().catch(() => false),
+          submit.isVisible().catch(() => false),
+        ]);
+        if (visible.every(Boolean)) return true;
+      } catch {
+        // The SSO page can replace its form while loading.
+      }
+    }
+    await page.waitForTimeout(500);
+  }
+
   return false;
 }
 
 async function attemptAutomaticLogin(page, config) {
+  if (!(await waitForLoginForm(page))) {
+    log("warn", "登录页表单加载超时，尚未填写账号。");
+    return false;
+  }
+
   const mode = ["auto", "username", "phone"].includes(config.loginMode)
     ? config.loginMode
     : "auto";
@@ -649,6 +750,44 @@ async function findPlayingFrame(page, config) {
   return best;
 }
 
+async function clickPlayerControls(page, preferredFrame = null) {
+  const frames = [
+    preferredFrame,
+    ...page.frames().filter((frame) => frame !== preferredFrame),
+  ].filter(Boolean);
+
+  for (const frame of frames) {
+    for (const selector of [
+      ".vjs-big-play-button",
+      ".vjs-play-control",
+      ".prism-play-btn",
+      ".dplayer-play-icon",
+    ]) {
+      try {
+        const control = frame.locator(selector).first();
+        if (await control.isVisible().catch(() => false)) {
+          await control.click({ timeout: 3000 });
+          return true;
+        }
+      } catch {
+        // Try the next player control.
+      }
+    }
+
+    try {
+      const video = frame.locator("video").first();
+      if (await video.isVisible().catch(() => false)) {
+        await video.click({ force: true, timeout: 3000 });
+        return true;
+      }
+    } catch {
+      // Direct video click is a fallback for custom players.
+    }
+  }
+
+  return false;
+}
+
 async function clickPlayControl(page) {
   for (const frame of page.frames()) {
     for (const label of ["继续学习", "开始学习", "播放"]) {
@@ -670,13 +809,50 @@ async function clickPlayControl(page) {
   return false;
 }
 
+async function waitForPlaybackStart(page, config, found) {
+  let frame = found.frame;
+  let state = found.state;
+  const deadline = Date.now() + Math.min(30000, config.videoWaitTimeoutMs);
+  let lastControlAt = 0;
+
+  while (Date.now() < deadline) {
+    try {
+      state = await inspectVideo(frame, config);
+    } catch {
+      const refreshed = await findPlayingFrame(page, config);
+      if (!refreshed) break;
+      frame = refreshed.frame;
+      state = refreshed.state;
+    }
+
+    if (state.ended || Number(state.currentTime) > 0.25) {
+      return { frame, state, started: true };
+    }
+
+    if (state.paused && Date.now() - lastControlAt > 3000) {
+      await clickPlayerControls(page, frame);
+      lastControlAt = Date.now();
+    }
+
+    await page.waitForTimeout(500);
+  }
+
+  return { frame, state, started: false };
+}
+
 async function waitForVideo(page, config) {
   const deadline = Date.now() + config.videoWaitTimeoutMs;
   let controlClicked = false;
 
   while (Date.now() < deadline) {
     const found = await findPlayingFrame(page, config);
-    if (found) return found;
+    if (found) {
+      const prepared = await waitForPlaybackStart(page, config, found);
+      if (!prepared.started) {
+        log("warn", "播放器已加载，但视频进度尚未开始推进，继续尝试播放。");
+      }
+      return prepared;
+    }
 
     if (!controlClicked) {
       controlClicked = await clickPlayControl(page);
@@ -700,10 +876,12 @@ async function watchVideo(page, config, task) {
 
   let frame = found.frame;
   let lastTime = -1;
-  let lastProgressLog = -1;
   let lastMovementAt = Date.now();
   let resumeAttempts = 0;
+  let lastControlAt = 0;
+  let zeroProgressWarned = false;
   const startedAt = Date.now();
+  lastPlainProgressBucket = -1;
 
   log("ok", `开始播放: ${task.text.slice(0, 80)}`);
 
@@ -750,6 +928,7 @@ async function watchVideo(page, config, task) {
       (Number.isFinite(duration) && duration > 0 && currentTime >= Math.max(0, duration - 1.5));
 
     if (complete) {
+      renderProgressBar(duration, duration, { ended: true, readyState: state.readyState });
       await page.waitForTimeout(1500);
       return { status: "completed", detail: `${seconds(duration)} 视频已播放结束` };
     }
@@ -761,21 +940,22 @@ async function watchVideo(page, config, task) {
     }
 
     if (state.paused) {
+      if (now - lastControlAt > 5000) {
+        await clickPlayerControls(page, frame);
+        lastControlAt = now;
+      }
       await inspectVideo(frame, config);
     }
 
-    const percent =
-      Number.isFinite(duration) && duration > 0
-        ? Math.min(100, Math.max(0, (currentTime / duration) * 100))
-        : -1;
-
-    if (percent >= 0) {
-      const bucket = Math.floor(percent / 10) * 10;
-      if (bucket !== lastProgressLog) {
-        lastProgressLog = bucket;
-        log("info", `进度 ${percent.toFixed(1)}% (${seconds(currentTime)} / ${seconds(duration)})`);
-      }
+    if (!zeroProgressWarned && currentTime <= 0.25 && now - startedAt > 15000) {
+      zeroProgressWarned = true;
+      log(
+        "warn",
+        `播放器停在 0 秒附近，paused=${state.paused}, readyState=${state.readyState}，正在继续尝试播放。`,
+      );
     }
+
+    renderProgressBar(currentTime, duration, state);
 
     if (now - lastMovementAt > 60000) {
       resumeAttempts += 1;
@@ -792,7 +972,6 @@ async function watchVideo(page, config, task) {
 }
 
 async function runTask(page, config, task) {
-  log("info", `进入任务: ${task.text.slice(0, 100)}`);
 
   await page.goto(task.url, {
     waitUntil: "domcontentloaded",
@@ -810,6 +989,26 @@ async function runTask(page, config, task) {
   return watchVideo(page, config, task);
 }
 
+async function getPrimaryPage(context) {
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  const pages = context.pages().filter((page) => !page.isClosed());
+  const page =
+    pages.find((candidate) => /^https?:/i.test(candidate.url())) ??
+    pages[0] ??
+    (await context.newPage());
+
+  let closed = 0;
+  for (const candidate of pages) {
+    if (candidate !== page) {
+      await candidate.close().catch(() => {});
+      closed += 1;
+    }
+  }
+  if (closed > 0) log("info", `已关闭 ${closed} 个浏览器恢复页面，只保留一个操作窗口。`);
+
+  return page;
+}
+
 async function launchBrowser(config) {
   await fs.mkdir(config.userDataDir, { recursive: true });
 
@@ -823,7 +1022,13 @@ async function launchBrowser(config) {
   };
 
   if (config.browser.engine === "chromium") {
-    options.args = ["--start-maximized"];
+    options.args = [
+      "--start-maximized",
+      "--no-first-run",
+      "--no-default-browser-check",
+      "--disable-session-crashed-bubble",
+      "--hide-crash-restore-bubble",
+    ];
   } else {
     delete options.viewport;
   }
@@ -860,7 +1065,7 @@ async function main() {
 
   const context = await launchBrowser(config);
   activeContext = context;
-  const page = context.pages()[0] ?? (await context.newPage());
+  const page = await getPrimaryPage(context);
   page.setDefaultTimeout(config.navigationTimeoutMs);
 
   let keepOpen = config.keepBrowserOpen;
